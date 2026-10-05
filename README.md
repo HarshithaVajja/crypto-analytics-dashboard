@@ -1,84 +1,109 @@
-# Real-Time Crypto Market Analytics Dashboard
+# Real-Time Crypto Market Analytics
 
-An end-to-end analytics pipeline that pulls live cryptocurrency market data from a public API, stores and models it in SQL, and visualizes it in Power BI with custom DAX measures for volatility, momentum, and ranking.
-
-## Overview
-
-This project tracks live prices, market caps, trading volume, and 24h price changes for 50 cryptocurrencies, refreshed on a schedule, and turns that raw data into an analyst-ready dashboard — top gainers/losers, price trend lines, and a volatility-vs-volume view.
-
-**Stack:** Python (ingestion) → SQLite (storage & analytical views) → Power BI (data model, DAX, dashboard)
+An end-to-end analytics pipeline: live cryptocurrency market data is collected every 15 minutes by an automated job, stored in a cloud PostgreSQL database, modelled with SQL window-function views, and visualised in a Power BI dashboard with custom DAX measures.
 
 ## Architecture
 
 ```
-CoinGecko public API
-        │
-        ▼
-Python ingestion script (fetch_crypto.py)
-   - runs on a schedule
-   - fetches price/volume/market cap for 50 coins
-        │
-        ▼
-SQLite database (crypto_analytics.db)
-   - raw price_snapshots table
-   - analytical SQL views (latest_prices, top_movers, price_momentum)
-        │
-        ▼
-Power BI (crypto_analytics.pbix)
-   - data model with relationships
-   - DAX measures (volatility, moving averages, ranking)
-   - 2-page interactive dashboard
+CoinGecko public API (top 50 coins by market cap)
+        |
+        v
+GitHub Actions  (scheduled workflow, every 15 minutes)
+  runs fetch_crypto.py --once
+        |
+        v
+Supabase PostgreSQL  (cloud database)
+  tables : coins, price_snapshots
+  views  : latest_prices, top_movers, price_momentum
+        |
+        v
+Power BI  (data model, DAX measures, 2-page dashboard)
 ```
 
-## Data pipeline (Python + SQL)
+## Tech stack
 
-`fetch_crypto.py` calls the CoinGecko `/coins/markets` endpoint on a repeating schedule and writes each snapshot into SQLite. No API key required.
+| Layer | Tool |
+|---|---|
+| Ingestion | Python (`requests`, `psycopg2`) |
+| Automation | GitHub Actions scheduled workflow with repository secrets |
+| Storage | PostgreSQL on Supabase |
+| Analysis | SQL views using `DISTINCT ON`, `RANK()`, `LAG()` |
+| Reporting | Power BI Desktop, DAX |
 
-SQL views built on top of the raw data:
+## Data pipeline
 
-- **`latest_prices`** — each coin's most recent snapshot, using a self-join on `MAX(captured_at)`
-- **`top_movers`** — coins ranked by 24h % change using `RANK() OVER (...)`
-- **`price_momentum`** — price change between consecutive snapshots using `LAG() OVER (PARTITION BY coin_id ORDER BY captured_at)`
+`fetch_crypto.py` calls the CoinGecko `/coins/markets` endpoint (no API key needed) and writes one batch of 50 coin snapshots to PostgreSQL with a single UTC timestamp per batch.
+
+- Retries with back-off when the API returns HTTP 429 (rate limit)
+- Database credentials are read from environment variables, never stored in the code
+- `--once` runs a single snapshot (used by the scheduled workflow); without it the script loops every 15 minutes for local use
+- `migrate_to_cloud.py` is a one-time script that moved the original local SQLite history into PostgreSQL. It is safe to re-run
+
+The scheduled job lives in `.github/workflows/collect.yml`.
+
+## SQL layer
+
+All views are in [`sql/views.sql`](sql/views.sql):
+
+- **`latest_prices`**: the most recent snapshot per coin, using `DISTINCT ON`
+- **`top_movers`**: coins ranked by 24h price change, using `RANK() OVER (...)`
+- **`price_momentum`**: price change between consecutive snapshots, using `LAG() OVER (PARTITION BY coin_id ORDER BY captured_at)`
 
 ## DAX measures
 
-| Measure | Formula | Purpose |
-|---|---|---|
-| Avg Price | `AVERAGE(price_snapshots[price_usd])` | Average price across tracked coins |
-| 24h Change % | `AVERAGE(price_snapshots[price_change_24h])` | Average 24h % change |
-| Price Volatility | `STDEV.P(price_snapshots[price_usd])` | Standard deviation of price — a volatility indicator |
-| Volatility Rank | `RANKX(ALL(price_snapshots[coin_id]), [Price Volatility], , DESC)` | Ranks coins from most to least volatile |
-| Session High / Low | `MAX(...)` / `MIN(...)` | Highest / lowest price captured |
-| Price Range | `[Session High] - [Session Low]` | Spread between high and low |
-| Distinct Coins | `DISTINCTCOUNT(price_snapshots[coin_id])` | Count of unique coins tracked |
+Full list with explanations in [`dax_measures.md`](dax_measures.md).
+
+| Measure | Purpose |
+|---|---|
+| Avg Price | Average price across selected coins |
+| 24h Change % | Average 24-hour percentage change |
+| Price Volatility | `STDEV.P` of price, the headline risk measure |
+| Volatility Rank | `RANKX` ranking of coins by volatility |
+| Session High / Low | Highest and lowest captured price |
+| Price Range | High minus low, a simple volatility proxy |
+| Distinct Coins | Number of unique coins tracked |
 
 ## Dashboard
 
-**Page 1 — Overview**
-- KPI cards: average price, 24h change %, distinct coins tracked
-- Ranked table of coins by market cap
-- Price trend line filterable by coin (via slicer)
+**Page 1: Overview**: KPI cards, market-cap table, price trend line with a coin slicer.
 
 ![Overview](screenshots/overview.png)
 
-**Page 2 — Movers & Volatility**
-- Top gainers/losers bar chart (24h % change)
-- Volatility ranking table
-- Volume vs. Volatility scatter chart — highlights coins with both high trading activity and high price swings (Bitcoin stood out clearly here despite being the most established coin in the set)
+**Page 2: Movers & Volatility**: top gainers bar chart, volatility ranking table, volume vs. volatility scatter chart.
 
 ![Movers & Volatility](screenshots/Movers%20%26%20Volatility.png)
 
-## What I'd do next
+## Run it yourself
 
-- Move from SQLite to PostgreSQL for native `STDDEV_POP()` support and better concurrent read/write handling
-- Set up scheduled refresh via Power BI Service instead of manual refresh
-- Add a third dashboard page with drill-through to a single coin's full detail view
-- Containerize the ingestion script with Docker and deploy it to run continuously in the cloud rather than a local terminal
+1. Create a free PostgreSQL database (for example on Supabase).
+2. Set these environment variables: `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`.
+3. Install dependencies and take a snapshot:
 
-## Files in this repo
+```
+pip install -r requirements.txt
+python fetch_crypto.py --once
+```
 
-- `fetch_crypto.py` — ingestion script
-- `crypto_analytics.db` — SQLite database with raw data and views
-- `crypto_analytics.sqbpro` — DB Browser for SQLite project file
-- `crypto_analytics.pbix` — Power BI dashboard file
-- `screenshots/` — dashboard page screenshots
+4. Run `sql/views.sql` in the database, then open `crypto_analytics.pbix` in Power BI Desktop and point it at your database.
+
+To automate collection, add the five variables above as repository secrets on GitHub. The workflow in `.github/workflows/collect.yml` does the rest.
+
+## Repository structure
+
+```
+.github/workflows/collect.yml   scheduled collection job
+fetch_crypto.py                 ingestion script
+migrate_to_cloud.py             one-time SQLite to PostgreSQL migration
+sql/views.sql                   analytical views
+dax_measures.md                 DAX measures with explanations
+crypto_analytics.pbix           Power BI report
+screenshots/                    dashboard screenshots
+requirements.txt
+```
+
+## What I would do next
+
+- Publish the dashboard publicly with scheduled refresh
+- Add alerts when a coin moves more than a set percentage between snapshots
+- Add a third page with drill-through to a single coin
+- Containerise the collector with Docker
